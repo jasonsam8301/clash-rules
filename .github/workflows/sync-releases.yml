@@ -1,0 +1,113 @@
+# 🔄 Clash Rules Releases 自動同步工作流
+# 
+# 將此文件放到你 fork 的 clash-rules 倉庫的 .github/workflows/ 目錄中
+# 它會自動從上游 Loyalsoldier/clash-rules 下載最新 Releases 並發布到你的 fork
+#
+# 設置步驟：
+# 1. Fork https://github.com/Loyalsoldier/clash-rules
+# 2. 在 fork 倉庫中創建 .github/workflows/sync-releases.yml
+# 3. 將此文件內容複製進去
+# 4. 確保倉庫的 Actions 權限已開啟
+
+name: Sync Releases from Upstream
+
+on:
+  schedule:
+    # 每天 UTC 01:00 執行
+    - cron: '0 1 * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: '強制重新發布'
+        required: false
+        default: 'false'
+
+env:
+  UPSTREAM_REPO: Loyalsoldier/clash-rules
+  
+jobs:
+  sync-releases:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Get upstream latest release
+        id: upstream
+        run: |
+          RELEASE_INFO=$(curl -s "https://api.github.com/repos/${{ env.UPSTREAM_REPO }}/releases/latest")
+          TAG=$(echo "$RELEASE_INFO" | jq -r '.tag_name')
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "📦 Upstream latest: $TAG"
+      
+      - name: Check if release exists
+        id: check
+        run: |
+          TAG="${{ steps.upstream.outputs.tag }}"
+          EXISTS=$(curl -s -o /dev/null -w "%{http_code}" \
+            "https://api.github.com/repos/${{ github.repository }}/releases/tags/$TAG")
+          
+          if [ "$EXISTS" = "200" ] && [ "${{ github.event.inputs.force }}" != "true" ]; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
+      
+      - name: Download upstream release assets
+        if: steps.check.outputs.exists == 'false'
+        run: |
+          mkdir -p release-assets
+          TAG="${{ steps.upstream.outputs.tag }}"
+          
+          ASSETS=$(curl -s "https://api.github.com/repos/${{ env.UPSTREAM_REPO }}/releases/latest" \
+            | jq -r '.assets[].browser_download_url')
+          
+          for url in $ASSETS; do
+            filename=$(basename "$url")
+            echo "📥 Downloading: $filename"
+            curl -fSL "$url" -o "release-assets/$filename"
+          done
+          
+          ls -lh release-assets/
+      
+      - name: Sync upstream code
+        if: steps.check.outputs.exists == 'false'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          git remote add upstream "https://github.com/${{ env.UPSTREAM_REPO }}.git" || true
+          git fetch upstream --tags
+          
+          git checkout master || git checkout main
+          git reset --hard upstream/master || git reset --hard upstream/main
+          git push origin HEAD --force
+          
+          # 同步 release 分支
+          if git ls-remote --heads upstream release | grep -q release; then
+            git checkout -B release upstream/release
+            git push origin release --force
+          fi
+          
+          git push origin --tags --force
+      
+      - name: Create release
+        if: steps.check.outputs.exists == 'false'
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ steps.upstream.outputs.tag }}
+          name: ${{ steps.upstream.outputs.tag }}
+          body: |
+            🔄 **Synced from upstream**
+            
+            - Source: [${{ env.UPSTREAM_REPO }}](https://github.com/${{ env.UPSTREAM_REPO }})
+            - Original: https://github.com/${{ env.UPSTREAM_REPO }}/releases/tag/${{ steps.upstream.outputs.tag }}
+          files: release-assets/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
